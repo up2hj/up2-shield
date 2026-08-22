@@ -5,7 +5,7 @@
  *   brute-force- és szkenner-szűrés, felhasználó-felderítés lezárása,
  *   ujjlenyomat-elrejtés, perzisztencia-figyelés (új admin, kártékony dropin),
  *   biztonsági napló és riasztás. Kereső-crawlereket sosem zár ki.
- * Version: 2.1
+ * Version: 2.2
  * Author: UP2Digital
  *
  * HORDOZHATÓSÁG: egyetlen fájl. Bármely WP-oldal mu-plugins mappájába másolva
@@ -28,7 +28,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 if ( defined( 'UP2_SHIELD_LOADED' ) ) { return; }
-define( 'UP2_SHIELD_LOADED', '2.1' );
+define( 'UP2_SHIELD_LOADED', '2.2' );
 
 /* =========================================================================
    KONFIGURÁCIÓ — ezt állítod át oldalanként.
