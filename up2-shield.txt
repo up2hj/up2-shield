@@ -1,0 +1,1005 @@
+<?php
+/**
+ * Plugin Name: UP2 Shield
+ * Description: Réteges WordPress-védelem: bot-menedzsment igazolt crawlerekkel,
+ *   brute-force- és szkenner-szűrés, felhasználó-felderítés lezárása,
+ *   ujjlenyomat-elrejtés, perzisztencia-figyelés (új admin, kártékony dropin),
+ *   biztonsági napló és riasztás. Kereső-crawlereket sosem zár ki.
+ * Version: 2.1
+ * Author: UP2Digital
+ *
+ * HORDOZHATÓSÁG: egyetlen fájl. Bármely WP-oldal mu-plugins mappájába másolva
+ * azonnal aktív (a mu-plugin nem kikapcsolható a felületről, így egy betörő sem
+ * tudja letiltani). A viselkedés a lenti UP2_SHIELD_CFG tömbbel hangolható.
+ *
+ * TERVEZÉSI ELVEK (biztonsági szemmel):
+ *  1. A jó botot IGAZOLNI kell, nem elhinni. A User-Agent hamisítható; a valódi
+ *     Googlebot forward-confirmed reverse DNS-sel bizonyítható. Csak az igazolt
+ *     crawler kap mentességet a korlátozások alól — így a keresők soha nem esnek
+ *     ki, a Googlebotnak hazudó támadó viszont a rendes szűrőbe fut.
+ *  2. Alapból megengedő, célzottan szigorú. Az emberi látogatót semmi nem
+ *     lassítja; a szigor a támadási felületekre (login, xmlrpc, szkennelt
+ *     útvonalak) és a viselkedésre (kérés-özön, hibás login-sorozat) irányul.
+ *  3. Csendes elnyelés. A blokk 403/429, nem árul el semmit a védelemről.
+ *  4. Perzisztencia = a legveszélyesebb. A 2026-08-i incidens auto_prepend és
+ *     rejtett admin volt. Az új admin és a kártékony dropin AZONNALI riasztást
+ *     kap — ez fogta volna meg a támadást az első percben.
+ */
+
+if ( ! defined( 'ABSPATH' ) ) { exit; }
+if ( defined( 'UP2_SHIELD_LOADED' ) ) { return; }
+define( 'UP2_SHIELD_LOADED', '2.1' );
+
+/* =========================================================================
+   KONFIGURÁCIÓ — ezt állítod át oldalanként.
+   ========================================================================= */
+$GLOBALS['UP2_SHIELD_CFG'] = [
+	'fingerprint_hide'   => true,   // verzió/generator/RSD/pingback elrejtése
+	'block_user_enum'    => true,   // REST users + ?author= felderítés tiltása
+	'disable_xmlrpc'     => true,   // xmlrpc.php kikapcsolása
+	'disable_feeds'      => true,   // RSS/Atom feed kikapcsolva (nincs rá igény, WP-ujjlenyomat)
+	'login_ratelimit'    => true,   // hibás bejelentkezés korlátozása IP-nként
+	'login_max_fails'    => 5,      // ennyi hibás próba után
+	'login_lockout_min'  => 15,     // ennyi percre tiltjuk az IP-t
+	'request_firewall'   => true,   // szkenner-útvonalak + kérés-özön szűrése
+	'req_burst_limit'    => 120,    // max kérés/IP/perc (igazolt crawler kivétel)
+	'scanner_block'      => true,   // ismert támadó-útvonalak azonnali tiltása
+	'honeypot'           => true,   // rejtett csapda-útvonal a botoknak
+	'watch_new_admin'    => true,   // új admin-felhasználó riasztása
+	'watch_dropins'      => true,   // kártékony dropin/mu-plugin riasztása
+	'alert_email'        => 'hava.janos@gmail.com',  // ide megy MINDEN riasztás (mindkét oldal)
+	'security_headers'   => true,   // védelmi HTTP-fejlécek
+	'auto_update'        => true,   // önfrissítés a központi helyről
+	'update_url'         => '',     // pl. https://raw.githubusercontent.com/USER/REPO/main (üres = kikapcsolva)
+	'update_secret'      => '',     // HMAC-kulcs az aláírás-ellenőrzéshez (KÖTELEZŐ auto_update-hez)
+	'block_php_upload'   => true,   // futtatható + SVG feltöltés tiltása
+	'rest_restrict'      => true,   // REST API szűkítése nem bejelentkezetteknek
+	'protect_wpcron'     => true,   // wp-cron.php külső hívásának blokkolása
+	'watch_dropins_live' => true,   // db.php/advanced-cache.php azonnali riasztás
+	'hide_login'         => true,   // wp-login.php elrejtése titkos slug mögé
+	'login_slug'         => 'vs-kapu',  // a titkos belépő útvonal (ÍRD ÁT!)
+	'mask_paths'         => true,   // /wp-content és /wp-includes álcázása a HTML-ben
+];
+
+// Oldal-specifikus felülírás — a frissítés NEM írja felül (update_secret, login_slug, stb.).
+$up2s_cfg_file = __DIR__ . '/up2-shield-config.php';
+if ( is_readable( $up2s_cfg_file ) ) {
+	$up2s_over = include $up2s_cfg_file;
+	if ( is_array( $up2s_over ) ) { $GLOBALS['UP2_SHIELD_CFG'] = array_merge( $GLOBALS['UP2_SHIELD_CFG'], $up2s_over ); }
+}
+
+function up2s_cfg( $k ) {
+	return $GLOBALS['UP2_SHIELD_CFG'][ $k ] ?? null;
+}
+
+/* =========================================================================
+   0. KÖZÖS: IP, napló, igazolt crawler
+   ========================================================================= */
+
+function up2s_ip() {
+	// A közvetlen kapcsolat IP-je. Proxy-fejléceket SZÁNDÉKOSAN nem hiszünk el
+	// (azok hamisíthatók); ha CDN van előtte, itt kell a valódi fejlécre váltani.
+	return preg_replace( '/[^0-9a-f:.]/i', '', $_SERVER['REMOTE_ADDR'] ?? '' );
+}
+
+/** Biztonsági esemény naplózása (körkörös, max ~500 sor az options-ban). */
+function up2s_log( $type, $detail = '' ) {
+	$log = get_option( 'up2s_log', [] );
+	if ( ! is_array( $log ) ) { $log = []; }
+	$log[] = [ 't' => time(), 'ip' => up2s_ip(), 'type' => $type,
+		'detail' => substr( (string) $detail, 0, 200 ),
+		'ua' => substr( $_SERVER['HTTP_USER_AGENT'] ?? '', 0, 120 ) ];
+	if ( count( $log ) > 500 ) { $log = array_slice( $log, -500 ); }
+	update_option( 'up2s_log', $log, false );
+}
+
+/**
+ * IGAZOLT KERESŐ-CRAWLER? — forward-confirmed reverse DNS.
+ *
+ * A User-Agent önmagában semmit sem bizonyít. A valódi crawler IP-je visszafelé
+ * feloldva a kereső domainjére mutat (pl. *.googlebot.com), és az a hosztnév
+ * előrefelé feloldva ugyanazt az IP-t adja. Ezt a kétirányú egyezést egy
+ * támadó nem tudja meghamisítani. Az eredményt IP-nként egy napra gyorsítótárba
+ * tesszük, hogy ne lassítson.
+ */
+function up2s_is_verified_crawler() {
+	static $memo = null;
+	if ( null !== $memo ) { return $memo; }
+
+	$ua = strtolower( $_SERVER['HTTP_USER_AGENT'] ?? '' );
+	$ip = up2s_ip();
+	if ( '' === $ua || '' === $ip ) { return $memo = false; }
+
+	// Csak akkor dolgozunk, ha az UA egyáltalán crawlernek vallja magát.
+	$claims = [
+		'googlebot' => [ '.googlebot.com', '.google.com' ],
+		'google-inspectiontool' => [ '.googlebot.com', '.google.com' ],
+		'bingbot' => [ '.search.msn.com' ],
+		'adidxbot' => [ '.search.msn.com' ],
+		'duckduckbot' => [ '.duckduckgo.com' ],
+		'yandex' => [ '.yandex.ru', '.yandex.net', '.yandex.com' ],
+		'applebot' => [ '.applebot.apple.com' ],
+		'slurp' => [ '.crawl.yahoo.net' ],
+	];
+	$domains = null;
+	foreach ( $claims as $needle => $doms ) {
+		if ( false !== strpos( $ua, $needle ) ) { $domains = $doms; break; }
+	}
+	if ( null === $domains ) { return $memo = false; }   // nem is crawlernek vallja magát
+
+	$cache_key = 'up2s_vc_' . md5( $ip );
+	$cached = get_transient( $cache_key );
+	if ( false !== $cached ) { return $memo = ( '1' === $cached ); }
+
+	$ok = false;
+	$host = @gethostbyaddr( $ip );                       // reverse
+	if ( $host && $host !== $ip ) {
+		$host_l = strtolower( $host );
+		foreach ( $domains as $d ) {
+			if ( substr( $host_l, - strlen( $d ) ) === $d ) {
+				// forward-confirm: a hosztnév vissza ugyanarra az IP-re mutat?
+				$fwd = @gethostbynamel( $host );
+				if ( is_array( $fwd ) && in_array( $ip, $fwd, true ) ) { $ok = true; }
+				break;
+			}
+		}
+	}
+	set_transient( $cache_key, $ok ? '1' : '0', DAY_IN_SECONDS );
+	if ( $ok ) { up2s_log( 'crawler_ok', $host ); }
+	return $memo = $ok;
+}
+
+/** Csendes blokk — a támadó ne tudja meg, mi fogta meg. */
+function up2s_block( $code, $reason ) {
+	up2s_log( 'block', $reason );
+	if ( ! headers_sent() ) {
+		status_header( $code );
+		header( 'Retry-After: 600' );
+		nocache_headers();
+	}
+	exit;
+}
+
+/* =========================================================================
+   1. KÉRÉS-TŰZFAL — a legkorábbi pont, még a WP betöltése közben (muplugins_loaded)
+   ========================================================================= */
+
+add_action( 'muplugins_loaded', function () {
+
+	$ip  = up2s_ip();
+	$uri = $_SERVER['REQUEST_URI'] ?? '';
+	$ua  = $_SERVER['HTTP_USER_AGENT'] ?? '';
+
+	// Az igazolt kereső MINDIG átjut — semmilyen korlát nem vonatkozik rá.
+	if ( up2s_is_verified_crawler() ) { return; }
+
+	/* TILTOTT IP: a fokozatos brute-force zár által kitiltott címet nem csak a
+	   bejelentkezésnél utasítjuk el — az egész oldalt nem éri el. */
+	if ( function_exists( 'up2s_is_banned' ) && up2s_is_banned( $ip ) ) {
+		up2s_block( 403, 'banned-ip' );
+	}
+
+	/* Bejelentkezett felhasználó (szerkesztő/admin) mentesül a kérés-özön- és
+	   bot-szűrő alól. A WP-user itt még nem tölt be, de a bejelentkezési süti
+	   megléte elárulja. A szerkesztés (admin-ajax, heartbeat, media) sok kérést
+	   ad — ezt nem szabad látogatói zajként fékezni. A szkenner-blokk viszont
+	   RÁ IS érvényes marad: egy lopott sütivel se lehessen shellt keresgélni. */
+	$logged_in = false;
+	foreach ( array_keys( $_COOKIE ) as $ck ) {
+		if ( 0 === strpos( $ck, 'wordpress_logged_in_' ) ) { $logged_in = true; break; }
+	}
+
+	/* 1a. SZKENNER-ÚTVONALAK — ismert támadó- és shell-minták. Aki ezeket kéri,
+	   nem látogató. Rövid, azonnali tiltás + számláló a kitartó IP-khez. */
+	if ( up2s_cfg( 'scanner_block' ) ) {
+		// A delimiter # (nem ~), mert a mintában szerepel a ~ karakter.
+		$bad = '#(?:'
+			. '\.env|\.git/|wp-config\.php[.~-]|/\.user\.ini|/vendor/phpunit'
+			. '|/(?:users|panel|shell|alfa|wso|cmd|gel4y|moon|radio|xxw|xyn|file1|up|about|admin|cache)\.php'
+			. '|eval-stdin\.php|/wp-content/(?:uploads|plugins|themes)/[^?]*\.php\?'
+			. '|/xmlrpc\.php|/wp-json/wp/v2/users'
+			. '|sppagebuilder|/wlwmanifest\.xml'
+			. ')#i';
+		if ( preg_match( $bad, $uri ) ) {
+			// A számláló: aki többször próbálkozik, hosszabb tiltást kap.
+			$k = 'up2s_scan_' . md5( $ip );
+			$n = (int) get_transient( $k ) + 1;
+			set_transient( $k, $n, HOUR_IN_SECONDS );
+			if ( $n >= 3 ) { up2s_block( 403, 'scanner-repeat: ' . $uri ); }
+			up2s_block( 404, 'scanner: ' . $uri );
+		}
+	}
+
+	/* 1b. ROSSZ BOTOK — üres UA, vagy ismert támadó/leszedő eszközök. A böngésző
+	   és minden legitim kliens küld értelmes UA-t. Bejelentkezettre nem hat. */
+	if ( up2s_cfg( 'request_firewall' ) && ! $logged_in ) {
+		$ua_l = strtolower( $ua );
+		if ( '' === trim( $ua ) ) { up2s_block( 403, 'empty-ua' ); }
+		$evil = [ 'nikto','sqlmap','nmap','masscan','nuclei','wpscan','fimap',
+			'zgrab','dirbuster','gobuster','feroxbuster','httrack','python-requests/0',
+			'go-http-client','libwww-perl','; wget','; curl' ];
+		foreach ( $evil as $e ) {
+			if ( false !== strpos( $ua_l, $e ) ) { up2s_block( 403, 'bad-ua: ' . $e ); }
+		}
+	}
+
+	/* 1c. A BEJELENTKEZÉSI OLDAL külön, szigorúbb korlátja. Itt egy ember percenként
+	   legfeljebb néhányszor próbálkozik; egy jelszótörő géppuska sokszor. A hibás
+	   próbák számlálója (wp_login_failed) mellett ez a nyers kérés-gyakoriságot is
+	   fékezi — még jelszó nélkül is. */
+	if ( up2s_cfg( 'login_ratelimit' ) && ! $logged_in
+		&& false !== strpos( $uri, '/wp-login.php' ) && 'POST' === ( $_SERVER['REQUEST_METHOD'] ?? '' ) ) {
+		$k = 'up2s_lr_' . md5( $ip );
+		$n = (int) get_transient( $k ) + 1;
+		set_transient( $k, $n, MINUTE_IN_SECONDS );
+		if ( $n > 10 ) { up2s_block( 429, 'login-flood: ' . $n . '/min' ); }
+	}
+
+	/* 1d. KÉRÉS-ÖZÖN — IP-nkénti perces korlát a dinamikus (PHP) kérésekre. A
+	   statikus fájlokat az Apache szolgálja ki, azok ide nem érnek el, tehát ez
+	   valójában oldal/perc korlát: az emberi böngészés messze alatta van, a
+	   leszedő botokat viszont fékezi. Bejelentkezett és igazolt crawler mentes. */
+	if ( up2s_cfg( 'request_firewall' ) && ! $logged_in ) {
+		$k = 'up2s_rate_' . md5( $ip );
+		$n = (int) get_transient( $k ) + 1;
+		set_transient( $k, $n, MINUTE_IN_SECONDS );
+		if ( $n > (int) up2s_cfg( 'req_burst_limit' ) ) {
+			up2s_block( 429, 'rate: ' . $n . '/min' );
+		}
+	}
+}, 1 );
+
+/* =========================================================================
+   2. HONEYPOT — csapda-útvonal. A robots.txt tiltja, ember sosem kéri; aki
+   mégis, az célzottan kutató bot → azonnali, hosszabb tiltás.
+   ========================================================================= */
+
+add_action( 'init', function () {
+	if ( ! up2s_cfg( 'honeypot' ) ) { return; }
+	$uri = $_SERVER['REQUEST_URI'] ?? '';
+	if ( false !== strpos( $uri, '/wp-secure-admin-panel' ) ) {
+		if ( up2s_is_verified_crawler() ) { return; }  // biztonsági kivétel
+		$k = 'up2s_hp_' . md5( up2s_ip() );
+		set_transient( $k, 1, 6 * HOUR_IN_SECONDS );
+		up2s_block( 403, 'honeypot' );
+	}
+} );
+
+// A csapdát a robots.txt-be tesszük (Disallow) — a jó crawler kihagyja,
+// a rossz bot pont az ilyen tiltott utakat kutatja.
+add_filter( 'robots_txt', function ( $out ) {
+	$out .= "\nDisallow: /wp-secure-admin-panel/\n";
+	return $out;
+}, 20 );
+
+/* =========================================================================
+   3. BEJELENTKEZÉS-VÉDELEM — fokozatosan szigorodó brute-force zár
+
+   Elv: az első néhány elgépelés emberi hiba, ne büntessük. De aki kitartóan
+   próbálkozik, annak EXPONENCIÁLISAN nő a tiltása — 15 perc, 1 óra, 24 óra —,
+   és a tartós tiltás túléli a memóriát (az adatbázisban is rögzül), tehát egy
+   újraindítás sem oldja fel. A tiltott IP-t nem csak a bejelentkezés utasítja
+   el: a kérés-tűzfal is kizárja, tehát az egész oldalt nem éri el.
+   ========================================================================= */
+
+/** Tartós tiltólista az adatbázisban (túléli a transient lejáratát). */
+function up2s_banlist() {
+	$b = get_option( 'up2s_banlist', [] );
+	return is_array( $b ) ? $b : [];
+}
+
+/** IP tiltása N másodpercre + naplózás. */
+function up2s_ban_ip( $ip, $seconds, $reason = '' ) {
+	$b = up2s_banlist();
+	$b[ $ip ] = [ 'until' => time() + $seconds, 'reason' => $reason ];
+	// Lejárt bejegyzések takarítása, hogy a lista ne hízzon.
+	foreach ( $b as $k => $v ) {
+		if ( ! is_array( $v ) || ( $v['until'] ?? 0 ) < time() ) { unset( $b[ $k ] ); }
+	}
+	if ( count( $b ) > 500 ) { $b = array_slice( $b, -500, null, true ); }
+	update_option( 'up2s_banlist', $b, false );
+	up2s_log( 'BAN', $ip . ' — ' . round( $seconds / 60 ) . ' percre — ' . $reason );
+}
+
+/** Tiltott-e az IP most? */
+function up2s_is_banned( $ip = null ) {
+	$ip = $ip ?: up2s_ip();
+	$b  = up2s_banlist();
+	return isset( $b[ $ip ] ) && ( $b[ $ip ]['until'] ?? 0 ) > time();
+}
+
+/* Hibás bejelentkezés → számláló + fokozatos tiltás. */
+add_action( 'wp_login_failed', function ( $username ) {
+	if ( ! up2s_cfg( 'login_ratelimit' ) ) { return; }
+	$ip = up2s_ip();
+
+	// Rövid távú számláló (1 óra ablak).
+	$k = 'up2s_lf_' . md5( $ip );
+	$n = (int) get_transient( $k ) + 1;
+	set_transient( $k, $n, HOUR_IN_SECONDS );
+
+	// Hosszú távú számláló (24 óra) — a lassan csepegtető támadót is elkapja.
+	$kd = 'up2s_lfd_' . md5( $ip );
+	$nd = (int) get_transient( $kd ) + 1;
+	set_transient( $kd, $nd, DAY_IN_SECONDS );
+
+	up2s_log( 'login_fail', "#$n (24h: $nd) user=" . substr( (string) $username, 0, 40 ) );
+
+	/* Fokozatos szigorítás. A küszöbök szándékosan nem kerek számok a
+	   találgatás ellen, és a napi számláló miatt a „lassú" támadó is elbukik. */
+	$max = (int) up2s_cfg( 'login_max_fails' );
+	if ( $nd >= 20 )      { up2s_ban_ip( $ip, DAY_IN_SECONDS,      "$nd hibás belépés 24 óra alatt" ); }
+	elseif ( $n >= 10 )   { up2s_ban_ip( $ip, HOUR_IN_SECONDS,     "$n hibás belépés 1 óra alatt" ); }
+	elseif ( $n >= $max ) { up2s_ban_ip( $ip, 15 * MINUTE_IN_SECONDS, "$n hibás belépés" ); }
+}, 10, 1 );
+
+/* Sikeres belépés → a számlálók nullázása (ne büntessük a jogos felhasználót). */
+add_action( 'wp_login', function () {
+	$ip = up2s_ip();
+	delete_transient( 'up2s_lf_' . md5( $ip ) );
+	delete_transient( 'up2s_lfd_' . md5( $ip ) );
+} );
+
+/* A tiltott IP be sem küldheti az űrlapot. */
+add_filter( 'authenticate', function ( $user ) {
+	if ( up2s_cfg( 'login_ratelimit' ) && up2s_is_banned() ) {
+		return new WP_Error( 'up2s_locked',
+			__( 'Túl sok sikertelen próbálkozás. Próbálja később.', 'default' ) );
+	}
+	return $user;
+}, 30 );
+
+// Egységes hibaüzenet + noindex a login-oldalon.
+add_filter( 'login_errors', function () { return __( 'Hibás bejelentkezési adatok.', 'default' ); } );
+add_action( 'login_head', function () { echo '<meta name="robots" content="noindex,nofollow">' . "\n"; } );
+
+/* =========================================================================
+   4. UJJLENYOMAT-ELREJTÉS — a passzív WP-jelek eltüntetése
+   ========================================================================= */
+
+add_action( 'plugins_loaded', function () {
+	if ( ! up2s_cfg( 'fingerprint_hide' ) ) { return; }
+
+	remove_action( 'wp_head', 'wp_generator' );
+	add_filter( 'the_generator', '__return_empty_string' );
+	remove_action( 'wp_head', 'rsd_link' );
+	remove_action( 'wp_head', 'wlwmanifest_link' );
+	remove_action( 'wp_head', 'wp_shortlink_wp_head' );
+	remove_action( 'wp_head', 'rest_output_link_wp_head' );
+	remove_action( 'wp_head', 'wp_oembed_add_discovery_links' );
+	remove_action( 'template_redirect', 'rest_output_link_header', 11 );
+
+	// A mag-assetekről levágja a verziót (a téma sajátjait meghagyja).
+	$strip = function ( $src ) {
+		if ( $src && false !== strpos( $src, 'ver=' )
+			&& ( false !== strpos( $src, '/wp-includes/' ) || false !== strpos( $src, '/wp-admin/' ) ) ) {
+			$src = remove_query_arg( 'ver', $src );
+		}
+		return $src;
+	};
+	add_filter( 'style_loader_src', $strip, 15 );
+	add_filter( 'script_loader_src', $strip, 15 );
+
+	add_filter( 'wp_headers', function ( $h ) { unset( $h['X-Pingback'] ); return $h; } );
+} );
+
+// A feed-linkek eltávolítása a HTML <head>-ből (a feed maga a disable_feeds-szel 410).
+add_action( 'init', function () {
+	if ( ! up2s_cfg( 'disable_feeds' ) ) { return; }
+	remove_action( 'wp_head', 'feed_links', 2 );
+	remove_action( 'wp_head', 'feed_links_extra', 3 );
+} );
+
+// Rank Math credit-kommentek eltávolítása (a bővítmény saját szűrője, öv és nadrágtartó).
+add_filter( 'rank_math/frontend/remove_credit_notice', '__return_true' );
+
+/* =========================================================================
+   5. FELHASZNÁLÓ-FELDERÍTÉS LEZÁRÁSA
+   ========================================================================= */
+
+if ( up2s_cfg( 'block_user_enum' ) ) {
+	add_filter( 'rest_endpoints', function ( $endpoints ) {
+		foreach ( [ '/wp/v2/users', '/wp/v2/users/(?P<id>[\d]+)' ] as $r ) {
+			if ( isset( $endpoints[ $r ] ) ) {
+				foreach ( $endpoints[ $r ] as $i => $h ) {
+					if ( is_array( $h ) && ! empty( $h['methods'] ) && false !== strpos( $h['methods'], 'GET' ) ) {
+						$endpoints[ $r ][ $i ]['permission_callback'] = function () { return current_user_can( 'list_users' ); };
+					}
+				}
+			}
+		}
+		return $endpoints;
+	} );
+	add_action( 'init', function () {
+		if ( ! is_admin() && isset( $_GET['author'] ) && preg_match( '/^\d+$/', (string) $_GET['author'] ) ) {
+			wp_safe_redirect( home_url( '/' ), 301 ); exit;
+		}
+	} );
+}
+
+/* =========================================================================
+   6. XML-RPC és FEED
+   ========================================================================= */
+
+if ( up2s_cfg( 'disable_xmlrpc' ) ) {
+	add_filter( 'xmlrpc_enabled', '__return_false' );
+	add_filter( 'xmlrpc_methods', function ( $m ) {
+		unset( $m['pingback.ping'], $m['pingback.extensions.getPingbacks'] ); return $m;
+	} );
+}
+if ( up2s_cfg( 'disable_feeds' ) ) {
+	foreach ( [ 'do_feed', 'do_feed_rdf', 'do_feed_rss', 'do_feed_rss2', 'do_feed_atom',
+		'do_feed_rss2_comments', 'do_feed_atom_comments' ] as $fh ) {
+		add_action( $fh, function () { wp_die( '', '', [ 'response' => 410 ] ); }, 1 );
+	}
+}
+
+/* =========================================================================
+   7. PERZISZTENCIA-FIGYELÉS — a 2026-08-i incidens tanulsága
+
+   Ezek a hook-ok azonnal riasztanak arra, ami a valódi támadásnál történt:
+   idegen admin létrejötte és jogosultság-emelés. Ez a leggyorsabb jelzés.
+   ========================================================================= */
+
+function up2s_alert( $subject, $body ) {
+	$to = up2s_cfg( 'alert_email' ) ?: get_option( 'admin_email' );
+	up2s_log( 'ALERT', $subject );
+	if ( $to ) {
+		wp_mail( $to, '[UP2 Shield] ' . $subject,
+			$body . "\n\nIdő: " . wp_date( 'Y-m-d H:i' ) . "\nIP: " . up2s_ip()
+			. "\nOldal: " . home_url() );
+	}
+}
+
+if ( up2s_cfg( 'watch_new_admin' ) ) {
+	// Új admin jött létre.
+	add_action( 'user_register', function ( $uid ) {
+		$u = get_userdata( $uid );
+		if ( $u && in_array( 'administrator', (array) $u->roles, true ) ) {
+			up2s_alert( 'ÚJ ADMIN létrejött: ' . $u->user_login,
+				"Egy új adminisztrátor jött létre: {$u->user_login} <{$u->user_email}>.\n"
+				. "Ha nem Ön hozta létre, AZONNAL töröltesse és cseréljen jelszót!" );
+		}
+	}, 10, 1 );
+	// Meglévő fiók adminná lépett elő.
+	add_action( 'set_user_role', function ( $uid, $role, $old ) {
+		if ( 'administrator' === $role && ! in_array( 'administrator', (array) $old, true ) ) {
+			$u = get_userdata( $uid );
+			up2s_alert( 'JOGOSULTSÁG-EMELÉS adminra: ' . ( $u ? $u->user_login : $uid ),
+				'Egy fiók adminisztrátori jogot kapott. Ha nem Ön tette, gyanús.' );
+		}
+	}, 10, 3 );
+	// Plugin/téma szerkesztő használata (kódbeírás kísérlete).
+	add_action( 'activated_plugin', function ( $plugin ) {
+		up2s_alert( 'Plugin aktiválva: ' . $plugin, 'Egy bővítményt aktiváltak. Ellenőrizze, Ön volt-e.' );
+	} );
+}
+
+/* =========================================================================
+   8. VÉDELMI HTTP-FEJLÉCEK (a .htaccess mellett kódból is, hordozhatóság)
+   ========================================================================= */
+
+if ( up2s_cfg( 'security_headers' ) ) {
+	add_filter( 'wp_headers', function ( $h ) {
+		$h['X-Content-Type-Options'] = 'nosniff';
+		$h['X-Frame-Options']        = 'SAMEORIGIN';
+		$h['Referrer-Policy']        = 'strict-origin-when-cross-origin';
+		return $h;
+	} );
+}
+
+/* =========================================================================
+   9. ADMIN — biztonsági napló nézet + állapot
+   ========================================================================= */
+
+add_action( 'admin_menu', function () {
+	add_management_page( 'UP2 Shield', 'UP2 Shield', 'manage_options', 'up2-shield', function () {
+
+		// Alapvonal újrarögzítése — legitim frissítés/telepítés után, hogy a
+		// fájlfigyelő ne a saját változtatásunkra riasszon.
+		if ( isset( $_POST['up2s_rebaseline'] ) && check_admin_referer( 'up2s_rebaseline' ) ) {
+			update_option( 'up2s_baseline', up2s_integrity_snapshot(), false );
+			up2s_log( 'integrity_baseline', 'kézi újrarögzítés' );
+			echo '<div class="notice notice-success"><p>Fájl-alapvonal frissítve — a mostani állapot mostantól a „tiszta" referencia.</p></div>';
+		}
+
+		$log = array_reverse( (array) get_option( 'up2s_log', [] ) );
+		echo '<div class="wrap"><h1>UP2 Shield — biztonsági napló</h1>';
+		echo '<p>Igazolt crawler mentesül minden korlát alól. Blokk = 403/429, csendes.</p>';
+
+		// Fájl-integritás állapot + újrarögzítő gomb.
+		$last = (int) get_option( 'up2s_last_scan', 0 );
+		echo '<div style="background:#fff;border:1px solid #ccd0d4;padding:12px 16px;margin:12px 0;max-width:820px">';
+		echo '<strong>Fájl-integritás:</strong> utolsó ellenőrzés: '
+			. ( $last ? esc_html( wp_date( 'Y-m-d H:i', $last ) ) : 'még nem futott' ) . '. ';
+		echo 'Frissítés vagy plugin-telepítés UTÁN nyomd meg ezt, hogy az új állapot legyen a referencia:';
+		echo '<form method="post" style="margin-top:8px">';
+		wp_nonce_field( 'up2s_rebaseline' );
+		echo '<button class="button button-primary" name="up2s_rebaseline" value="1">Fájl-alapvonal újrarögzítése</button>';
+		echo '</form></div>';
+		echo '<table class="widefat striped"><thead><tr><th>Idő</th><th>Típus</th><th>IP</th><th>Részlet</th><th>UA</th></tr></thead><tbody>';
+		foreach ( array_slice( $log, 0, 200 ) as $e ) {
+			printf( '<tr><td>%s</td><td><strong>%s</strong></td><td>%s</td><td>%s</td><td style="font-size:11px;color:#777">%s</td></tr>',
+				esc_html( wp_date( 'm-d H:i:s', $e['t'] ?? 0 ) ), esc_html( $e['type'] ?? '' ),
+				esc_html( $e['ip'] ?? '' ), esc_html( $e['detail'] ?? '' ), esc_html( $e['ua'] ?? '' ) );
+		}
+		echo '</tbody></table></div>';
+	} );
+} );
+
+add_action( 'wp_dashboard_setup', function () {
+	if ( ! current_user_can( 'manage_options' ) ) { return; }
+	wp_add_dashboard_widget( 'up2s_widget', 'UP2 Shield — állapot', function () {
+		$log = (array) get_option( 'up2s_log', [] );
+		$since = time() - DAY_IN_SECONDS;
+		$blocks = $alerts = 0;
+		foreach ( $log as $e ) {
+			if ( ( $e['t'] ?? 0 ) < $since ) { continue; }
+			if ( 'block' === ( $e['type'] ?? '' ) ) { $blocks++; }
+			if ( 'ALERT' === ( $e['type'] ?? '' ) ) { $alerts++; }
+		}
+		printf( '<p><strong>%d</strong> blokkolt kérés az elmúlt 24 órában.</p>', $blocks );
+		if ( $alerts ) { printf( '<p style="color:#b32d2e"><strong>%d riasztás!</strong> Nézze meg az Eszközök → UP2 Shield oldalt.</p>', $alerts ); }
+		else { echo '<p style="color:#2a7">Nincs riasztás.</p>'; }
+	} );
+} );
+
+/* =========================================================================
+   10. FÁJL-INTEGRITÁS ÉS PERZISZTENCIA-ŐRSZEM — a 2026-08-i incidens magja
+
+   A támadás nem a WP-n keresztül tartotta magát, hanem a fájlrendszerben:
+   kártékony dropin (db.php), rejtett mu-plugin, és egy .user.ini→auto_prepend
+   perzisztencia. Ez a modul pont ezeket a felületeket figyeli — óránként
+   cronból és admin-oldalbetöltéskor —, és eltérésnél AZONNAL riaszt.
+
+   Platformfüggetlen: nem igényel szerver-hozzáférést vagy külső cront, a
+   pluginnal együtt bárhová átvihető (szemben a szerveren futó bash-őrszemmel).
+   ========================================================================= */
+
+if ( up2s_cfg( 'watch_dropins' ) ) {
+
+	// Óránkénti ütemezés.
+	add_filter( 'cron_schedules', function ( $s ) {
+		$s['up2s_hourly'] = [ 'interval' => HOUR_IN_SECONDS, 'display' => 'UP2 Shield óránként' ];
+		return $s;
+	} );
+	add_action( 'init', function () {
+		if ( ! wp_next_scheduled( 'up2s_integrity_scan' ) ) {
+			wp_schedule_event( time() + 300, 'up2s_hourly', 'up2s_integrity_scan' );
+		}
+	} );
+	add_action( 'up2s_integrity_scan', 'up2s_integrity_check' );
+
+	// Admin belépéskor is fusson egy gyors ellenőrzés (ha a cron elakadna).
+	add_action( 'admin_init', function () {
+		$last = (int) get_option( 'up2s_last_scan', 0 );
+		if ( time() - $last > HOUR_IN_SECONDS ) { up2s_integrity_check(); }
+	} );
+}
+
+/**
+ * A veszélyes felületek pillanatképe. Az első futás rögzíti a „tiszta"
+ * alapvonalat; utána minden eltérés gyanús és riasztást ér.
+ */
+function up2s_integrity_snapshot() {
+	$snap = [ 'dropins' => [], 'muplugins' => [], 'userini' => '', 'theme' => [] ];
+
+	$content = defined( 'WP_CONTENT_DIR' ) ? WP_CONTENT_DIR : ABSPATH . 'wp-content';
+
+	// 1. Dropinok — ezek minden kérésnél futnak, ezért a kedvenc perzisztencia-hely.
+	foreach ( [ 'db.php', 'object-cache.php', 'advanced-cache.php', 'sunrise.php', 'maintenance.php' ] as $d ) {
+		$p = $content . '/' . $d;
+		if ( is_file( $p ) ) { $snap['dropins'][ $d ] = md5_file( $p ) . ':' . filesize( $p ); }
+	}
+
+	// 2. mu-plugins — ide tett fájl automatikusan és láthatatlanul fut.
+	$mu = $content . '/mu-plugins';
+	if ( is_dir( $mu ) ) {
+		foreach ( (array) glob( $mu . '/*.php' ) as $f ) {
+			if ( basename( $f ) === basename( __FILE__ ) ) { continue; }  // önmagát ne
+			$snap['muplugins'][ basename( $f ) ] = md5_file( $f ) . ':' . filesize( $f );
+		}
+	}
+
+	// 3. .user.ini — az auto_prepend_file itt kap perzisztenciát.
+	$ini = ABSPATH . '.user.ini';
+	if ( is_file( $ini ) ) { $snap['userini'] = md5_file( $ini ); }
+
+	// 4. Az aktív téma belépő fájljai — a functions.php-ba injektálás klasszikus.
+	$theme = get_stylesheet_directory();
+	foreach ( [ 'functions.php', 'header.php', 'footer.php', 'index.php' ] as $tf ) {
+		$p = $theme . '/' . $tf;
+		if ( is_file( $p ) ) { $snap['theme'][ $tf ] = md5_file( $p ) . ':' . filesize( $p ); }
+	}
+	return $snap;
+}
+
+/** Gyanús kódminták egy fájlban (obfuszkáció, dropper-kézjegy). */
+function up2s_looks_malicious( $file ) {
+	if ( ! is_file( $file ) || filesize( $file ) > 6 * 1024 * 1024 ) { return false; }
+	$s = (string) file_get_contents( $file, false, null, 0, 200000 );
+	$signs = [
+		'static $a=null;if($a===null)',           // string-dekóder tömb
+		'SC_TH_BEGIN', 'SC_DB_BEGIN',             // a konkrét kártevő jelölése
+		'crux-feeder',
+		'gzinflate(base64_decode', 'eval(gzinflate', 'eval(base64_decode',
+		'${"\x', 'chr(', // gyakori obfuszkáció (önmagában gyenge jel, ezért lentebb súlyozzuk)
+	];
+	$hits = 0;
+	foreach ( $signs as $sig ) { if ( false !== strpos( $s, $sig ) ) { $hits++; } }
+	// Erős jel: dekóder-tömb VAGY a konkrét jelölés VAGY eval+tömörítés.
+	return ( false !== strpos( $s, 'static $a=null;if($a===null)' )
+		|| false !== strpos( $s, 'SC_TH_BEGIN' ) || false !== strpos( $s, 'SC_DB_BEGIN' )
+		|| false !== strpos( $s, 'crux-feeder' )
+		|| preg_match( '~eval\s*\(\s*(?:gzinflate|base64_decode|gzuncompress|str_rot13)~i', $s ) );
+}
+
+/**
+ * Az ellenőrzés: összeveti a mostani állapotot az alapvonallal, és külön
+ * megnézi, van-e kártékony minta az új/megváltozott fájlokban.
+ */
+function up2s_integrity_check() {
+	update_option( 'up2s_last_scan', time(), false );
+
+	$now  = up2s_integrity_snapshot();
+	$base = get_option( 'up2s_baseline' );
+
+	// Első futás: rögzítjük az alapvonalat, de a nyilvánvalóan kártékony
+	// mintát már itt is jelezzük (hátha fertőzötten telepítettük).
+	if ( ! is_array( $base ) ) {
+		update_option( 'up2s_baseline', $now, false );
+		up2s_scan_for_malware_now();
+		up2s_log( 'integrity_baseline', 'alapvonal rögzítve' );
+		return;
+	}
+
+	$diffs = [];
+
+	// Dropinok: bármi új vagy megváltozott dropin gyanús.
+	foreach ( $now['dropins'] as $name => $hash ) {
+		if ( ! isset( $base['dropins'][ $name ] ) ) { $diffs[] = "ÚJ dropin: $name"; }
+		elseif ( $base['dropins'][ $name ] !== $hash ) { $diffs[] = "MÓDOSULT dropin: $name"; }
+	}
+	// mu-plugins: új fájl a legerősebb jel (a kártevő ide másolt).
+	foreach ( $now['muplugins'] as $name => $hash ) {
+		if ( ! isset( $base['muplugins'][ $name ] ) ) { $diffs[] = "ÚJ mu-plugin: $name"; }
+		elseif ( $base['muplugins'][ $name ] !== $hash ) { $diffs[] = "MÓDOSULT mu-plugin: $name"; }
+	}
+	// .user.ini változás.
+	if ( $now['userini'] !== $base['userini'] ) { $diffs[] = 'MÓDOSULT .user.ini (auto_prepend?)'; }
+	// Téma-fájlok.
+	foreach ( $now['theme'] as $name => $hash ) {
+		if ( isset( $base['theme'][ $name ] ) && $base['theme'][ $name ] !== $hash ) {
+			$diffs[] = "MÓDOSULT téma-fájl: $name";
+		}
+	}
+
+	// Kártékony minta keresése — ez a diffektől függetlenül is riaszt.
+	$malware = up2s_scan_for_malware_now();
+
+	if ( $diffs || $malware ) {
+		$body = "A fájlfigyelő eltérést talált a védett felületeken.\n\n";
+		if ( $malware ) { $body .= "KÁRTÉKONY MINTA:\n - " . implode( "\n - ", $malware ) . "\n\n"; }
+		if ( $diffs )   { $body .= "Változások az alapvonalhoz képest:\n - " . implode( "\n - ", $diffs ) . "\n\n"; }
+		$body .= "Ha nem Ön telepített/frissített, ez betörés jele. Teendő: nézze meg a fájlokat,\n"
+			. "és ha gyanús, kérjen segítséget. Az alapvonal frissítéséhez: Eszközök → UP2 Shield.";
+		up2s_alert( ( $malware ? 'KÁRTÉKONY FÁJL észlelve!' : 'Fájlváltozás a védett zónában' ), $body );
+	}
+}
+
+/** Végignézi a dropinokat és a mu-plugineket kártékony mintára. */
+function up2s_scan_for_malware_now() {
+	$content = defined( 'WP_CONTENT_DIR' ) ? WP_CONTENT_DIR : ABSPATH . 'wp-content';
+	$found = [];
+	$targets = array_merge(
+		(array) glob( $content . '/*.php' ),
+		(array) glob( $content . '/mu-plugins/*.php' ),
+		[ get_stylesheet_directory() . '/functions.php' ]
+	);
+	foreach ( $targets as $f ) {
+		if ( $f && basename( $f ) !== basename( __FILE__ ) && up2s_looks_malicious( $f ) ) {
+			$found[] = str_replace( ABSPATH, '', $f );
+			up2s_log( 'MALWARE_FILE', $f );
+		}
+	}
+	return $found;
+}
+
+/* =========================================================================
+   11. FELTÖLTÉS-SZŰRŐ — futtatható és kockázatos fájltípusok tiltása
+
+   A webshell klasszikus útja a médiatárba feltöltött .php (vagy .phtml,
+   álcázott kettős kiterjesztés). Az SVG önmagában is XSS-hordozó (script a
+   vektorgrafikában). Ezeket a feltöltésnél elutasítjuk.
+   ========================================================================= */
+
+if ( up2s_cfg( 'block_php_upload' ) ) {
+	add_filter( 'wp_handle_upload_prefilter', function ( $file ) {
+		$name = strtolower( $file['name'] ?? '' );
+		$bad  = '#\.(php\d?|phtml|pht|phar|phps|cgi|pl|py|asp|aspx|jsp|sh|svg|htaccess)($|\.)#i';
+		if ( preg_match( $bad, $name ) ) {
+			$file['error'] = __( 'Ez a fájltípus biztonsági okból nem tölthető fel.', 'default' );
+			up2s_log( 'upload_blocked', $name );
+		}
+		return $file;
+	} );
+	// A megengedett MIME-listából is kivesszük az SVG-t (ha egy plugin hozzáadná).
+	add_filter( 'upload_mimes', function ( $m ) {
+		unset( $m['svg'], $m['svgz'] );
+		return $m;
+	}, 99 );
+}
+
+/* =========================================================================
+   12. REST API SZŰKÍTÉSE — a felderítés és a visszaélés felülete
+
+   A REST API sok mindent kiad névtelenül. A tartalmi végpontok (a téma/blokk-
+   szerkesztő igényli) maradnak, de a felhasználó-, komment- és beállítás-
+   felderítést lezárjuk a be nem jelentkezett kéréseknek.
+   ========================================================================= */
+
+if ( up2s_cfg( 'rest_restrict' ) ) {
+	add_filter( 'rest_authentication_errors', function ( $result ) {
+		if ( ! empty( $result ) ) { return $result; }
+		if ( is_user_logged_in() ) { return $result; }
+
+		$route = $_SERVER['REQUEST_URI'] ?? '';
+		// Névtelenül tiltott felderítő végpontok.
+		$blocked = '#/wp/v2/(users|comments|settings|plugins|themes|media/[0-9]+/post-process)#i';
+		if ( preg_match( $blocked, $route ) ) {
+			return new WP_Error( 'rest_forbidden', 'Nincs jogosultság.', [ 'status' => 401 ] );
+		}
+		return $result;
+	} );
+}
+
+/* =========================================================================
+   13. WP-CRON VÉDELEM — a külső trigger kizárása
+
+   A 2026-08-i fertőzést egy külső wp-cron.php-hívás indította el. Ha a
+   wp-config-ban DISABLE_WP_CRON=true (és egy rendszer-cron hívja a WP-CLI-t),
+   akkor a nyilvános wp-cron.php felesleges és kívülről nem hívható. Ez a réteg
+   a HTTP-hívást a saját szerverre (loopback) és a WP belső kulcsára korlátozza.
+   ========================================================================= */
+
+if ( up2s_cfg( 'protect_wpcron' ) ) {
+	add_action( 'muplugins_loaded', function () {
+		$uri = $_SERVER['REQUEST_URI'] ?? '';
+		if ( false === strpos( $uri, '/wp-cron.php' ) ) { return; }
+		// A WP belső cron-hívása a doing_wp_cron kulcsot viszi; a loopback IP is elfogadott.
+		$ip = up2s_ip();
+		$internal = in_array( $ip, [ '127.0.0.1', '::1' ], true )
+			|| ! empty( $_GET['doing_wp_cron'] );
+		if ( ! $internal && ! up2s_is_verified_crawler() ) {
+			// Külső, kézi wp-cron trigger — nem szolgáljuk ki.
+			up2s_block( 403, 'external-wpcron' );
+		}
+	}, 0 );
+}
+
+/* =========================================================================
+   14. AKTÍV DROPIN-MONITOR — azonnali riasztás minden kérésnél
+
+   Az óránkénti integritás-ellenőrzés mellett minden oldalletöltéskor egy
+   olcsó villámellenőrzés: megjelent-e kártékony dropin (db.php, object-cache,
+   advanced-cache) vagy hex-nevű fájl a wp-content gyökerében. Költsége néhány
+   fájlrendszer-hívás; cserébe percek helyett azonnal jelez.
+   ========================================================================= */
+
+if ( up2s_cfg( 'watch_dropins_live' ) ) {
+	add_action( 'init', function () {
+		// Csak ritkán fusson le a teljes ellenőrzés (ne minden kérésnél terheljen).
+		if ( get_transient( 'up2s_dropin_ok' ) ) { return; }
+		set_transient( 'up2s_dropin_ok', 1, 5 * MINUTE_IN_SECONDS );
+
+		$content = defined( 'WP_CONTENT_DIR' ) ? WP_CONTENT_DIR : ABSPATH . 'wp-content';
+		$hits = [];
+
+		// Gyanús dropinok, amiket nem mi telepítettünk.
+		foreach ( [ 'db.php', 'object-cache.php' ] as $d ) {
+			$p = $content . '/' . $d;
+			if ( is_file( $p ) && up2s_looks_malicious( $p ) ) { $hits[] = $d; }
+		}
+		// Hex-nevű fájlok (a kártevő kézjegye).
+		foreach ( (array) glob( $content . '/{,.}[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].php', GLOB_BRACE ) as $h ) {
+			$hits[] = basename( $h );
+		}
+		// wp-content/.user.ini auto_prepend — a mostani visszatérés oka.
+		$ini = $content . '/.user.ini';
+		if ( is_file( $ini ) && false !== strpos( (string) file_get_contents( $ini ), 'auto_prepend_file' ) ) {
+			$hits[] = '.user.ini (auto_prepend!)';
+		}
+
+		if ( $hits ) {
+			up2s_alert( 'KÁRTÉKONY FÁJL a wp-content-ben!',
+				"Azonnali észlelés: " . implode( ', ', $hits ) . "\n"
+				. "Ez a 2026-08-i kártevő visszatérésének jele. Az őrszem törli, de nézze meg." );
+		}
+	}, 5 );
+}
+
+/* =========================================================================
+   15. BEJELENTKEZŐ-OLDAL ELREJTÉSE — a /wp-login.php eltüntetése
+   ========================================================================= */
+
+if ( up2s_cfg( 'hide_login' ) ) {
+
+	$up2s_slug = trim( (string) up2s_cfg( 'login_slug' ), '/' );
+
+	// A titkos slug betölti a bejelentkező oldalt.
+	add_action( 'init', function () use ( $up2s_slug ) {
+		if ( ! $up2s_slug ) { return; }
+		$req = trim( parse_url( $_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH ), '/' );
+		if ( $req === $up2s_slug ) {
+			require ABSPATH . 'wp-login.php';
+			exit;
+		}
+	}, 1 );
+
+	// A wp-login.php közvetlen elérése 404 (kivéve POST, logout, jelszó-reset).
+	add_action( 'init', function () {
+		$path = trim( parse_url( $_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH ), '/' );
+		if ( 'wp-login.php' !== basename( $path ) ) { return; }
+		$action = $_REQUEST['action'] ?? '';
+		$post   = 'POST' === ( $_SERVER['REQUEST_METHOD'] ?? '' );
+		$allowed = $post || in_array( $action, [ 'logout', 'rp', 'resetpass', 'postpass' ], true )
+			|| ! empty( $_GET['loggedout'] );
+		if ( ! $allowed ) {
+			status_header( 404 ); nocache_headers();
+			if ( $tpl = get_404_template() ) { include $tpl; }
+			exit;
+		}
+	}, 0 );
+
+	// A wp-admin nem-bejelentkezett elérése is 404 (admin-ajax/admin-post marad).
+	add_action( 'init', function () {
+		if ( ! is_admin() || wp_doing_ajax() || is_user_logged_in() ) { return; }
+		if ( defined( 'DOING_CRON' ) ) { return; }
+		global $pagenow;
+		if ( in_array( $pagenow, [ 'admin-ajax.php', 'admin-post.php' ], true ) ) { return; }
+		status_header( 404 ); nocache_headers();
+		if ( $tpl = get_404_template() ) { include $tpl; }
+		exit;
+	}, 0 );
+
+	// Az átirányítások a titkos slugra mutassanak.
+	add_filter( 'logout_url', function ( $url ) use ( $up2s_slug ) {
+		return str_replace( 'wp-login.php', $up2s_slug, $url );
+	} );
+	add_filter( 'lostpassword_url', function ( $url ) use ( $up2s_slug ) {
+		return str_replace( 'wp-login.php', $up2s_slug, $url );
+	} );
+}
+
+/* =========================================================================
+   16. ÚTVONAL-ÁLCÁZÁS — a /wp-content és /wp-includes eltüntetése a HTML-ből
+
+   A kimenő HTML-ben a WordPress-árulkodó mappaneveket semleges álnévre
+   cseréljük (/static/, /lib/). A .htaccess visszafordítja a szerveren, így a
+   böngésző a valódi neveket nem látja. Ez obscurity-réteg — a sütinevek és a
+   REST még árulkodhatnak —, de a tömeges botok mintaillesztését megzavarja.
+
+   Az admin, a bejelentkezés és a REST érintetlen (ott a valódi utak kellenek).
+   ========================================================================= */
+
+if ( up2s_cfg( 'mask_paths' ) || up2s_cfg( 'fingerprint_hide' ) ) {
+	add_action( 'template_redirect', function () {
+		if ( is_admin() || is_user_logged_in() ) { return; }
+		$req = $_SERVER['REQUEST_URI'] ?? '';
+		if ( false !== strpos( $req, '/wp-json' ) || false !== strpos( $req, 'wp-login' ) ) { return; }
+		ob_start( 'up2s_mask_buffer' );
+	}, 1 );
+}
+
+function up2s_mask_buffer( $html ) {
+	if ( strlen( $html ) < 200 ) { return $html; }
+	// Plugin-azonosító HTML-kommentek eltávolítása (Rank Math, Yoast, WP SEO stb.)
+	// — ezek elárulják a WordPress-t és a használt bővítményeket.
+	if ( up2s_cfg( 'fingerprint_hide' ) ) {
+		$html = preg_replace( '/<!--[^>]*(Rank Math|Yoast|WordPress SEO|WP Rocket|Powered by|This site is optimized)[^>]*-->/i', '', $html );
+		// CSS-kommentek is, amik plugin-nevet tartalmaznak (pl. breadcrumb-stílus).
+		$html = preg_replace( '#/\*[^*]*(Rank Math|Yoast|WordPress SEO|WP Rocket)[^*]*\*/#i', '', $html );
+	}
+	// Útvonal-álcázás.
+	if ( up2s_cfg( 'mask_paths' ) ) {
+		$html = str_replace( [ '/wp-content/', '/wp-includes/' ], [ '/static/', '/lib/' ], $html );
+	}
+	return $html;
+}
+
+/* =========================================================================
+   17. ÖNFRISSÍTŐ — több oldalon egy központi helyről
+
+   A mu-plugineket a WordPress natív plugin-frissítője nem kezeli (nincs
+   "aktiválás"), ezért a shield MAGA frissíti magát. Naponta egyszer lekérdez
+   egy központi verzió-fájlt; ha ott újabb szám áll, letölti az új up2-shield.php-t
+   és felülírja önmagát. Így egyetlen helyen frissítesz, és minden telepített
+   oldal követi.
+
+   KÖZPONTI HELY (update_url), két fájllal:
+     <update_url>/up2-shield-version.txt   → csak a verziószám, pl. 1.6
+     <update_url>/up2-shield.php            → a friss plugin
+   Lehet GitHub raw (raw.githubusercontent.com/USER/REPO/main) vagy saját HTTPS.
+
+   BIZTONSÁG: csak akkor ír felül, ha a letöltött fájl (a) tartalmazza az
+   UP2_SHIELD azonosítót, (b) van benne a config-tömb, (c) ésszerű méretű.
+   Így egy csonka/hamis válasz nem rontja el a védelmet.
+   ========================================================================= */
+
+if ( up2s_cfg( 'auto_update' ) && up2s_cfg( 'update_url' ) ) {
+
+	add_filter( 'cron_schedules', function ( $s ) {
+		if ( ! isset( $s['up2s_daily'] ) ) {
+			$s['up2s_daily'] = [ 'interval' => DAY_IN_SECONDS, 'display' => 'UP2 Shield naponta' ];
+		}
+		return $s;
+	} );
+	add_action( 'init', function () {
+		if ( ! wp_next_scheduled( 'up2s_self_update' ) ) {
+			wp_schedule_event( time() + HOUR_IN_SECONDS, 'up2s_daily', 'up2s_self_update' );
+		}
+	} );
+	add_action( 'up2s_self_update', 'up2s_do_self_update' );
+
+	// Admin-belépéskor is, ha rég nem futott (a cron elakadhat).
+	add_action( 'admin_init', function () {
+		if ( time() - (int) get_option( 'up2s_last_update_check', 0 ) > DAY_IN_SECONDS ) {
+			up2s_do_self_update();
+		}
+	} );
+}
+
+function up2s_do_self_update() {
+	update_option( 'up2s_last_update_check', time(), false );
+	$base = rtrim( (string) up2s_cfg( 'update_url' ), '/' );
+	if ( ! $base ) { return; }
+
+	// 1. Távoli verzió.
+	$vr = wp_remote_get( $base . '/up2-shield-version.txt', [ 'timeout' => 15 ] );
+	if ( is_wp_error( $vr ) || 200 !== wp_remote_retrieve_response_code( $vr ) ) { return; }
+	$remote = trim( wp_remote_retrieve_body( $vr ) );
+	if ( ! preg_match( '/^\d+\.\d+(\.\d+)?$/', $remote ) ) { return; }
+
+	// 2. Csak ha újabb, mint a mostani.
+	if ( version_compare( $remote, (string) UP2_SHIELD_LOADED, '<=' ) ) { return; }
+
+	// 3. Az új fájl letöltése.
+	$fr = wp_remote_get( $base . '/up2-shield.txt', [ 'timeout' => 30 ] );
+	if ( is_wp_error( $fr ) || 200 !== wp_remote_retrieve_response_code( $fr ) ) { return; }
+	$code = wp_remote_retrieve_body( $fr );
+
+	// 4/a. ALÁÍRÁS-ellenőrzés: a .sig a php HMAC-SHA256 aláírása az update_secret-tel.
+	//      Enélkül egy manipulált központi fájl nem tud érvényes frissítést készíteni.
+	$secret = (string) up2s_cfg( 'update_secret' );
+	if ( '' === $secret ) { up2s_log( 'update_no_secret', 'nincs update_secret — kihagyva' ); return; }
+	$sr = wp_remote_get( $base . '/up2-shield.txt.sig', [ 'timeout' => 15 ] );
+	if ( is_wp_error( $sr ) || 200 !== wp_remote_retrieve_response_code( $sr ) ) { return; }
+	$sig = trim( wp_remote_retrieve_body( $sr ) );
+	$calc = hash_hmac( 'sha256', $code, $secret );
+	if ( ! hash_equals( $calc, $sig ) ) { up2s_log( 'update_bad_signature', 'az aláírás nem egyezik — ELUTASÍTVA' ); return; }
+
+	// 4. Épség-ellenőrzés — ne írjunk felül szeméttel.
+	if ( strlen( $code ) < 8000
+		|| false === strpos( $code, 'UP2_SHIELD_LOADED' )
+		|| false === strpos( $code, 'UP2_SHIELD_CFG' )
+		|| 0 !== strpos( ltrim( $code ), '<?php' ) ) {
+		up2s_log( 'update_rejected', 'a letöltött fájl nem tűnik érvényes shieldnek' );
+		return;
+	}
+
+	// 5. Felülírás (a saját fájl helyben cseréje) + biztonsági másolat.
+	//    A plugint 444-en tartjuk a malware ellen; a frissítés idejére a tulajdonos
+	//    (a PHP-folyamat) feloldja, ír, majd visszazárja.
+	$self = __FILE__;
+	@chmod( $self, 0644 );
+	@copy( $self, $self . '.bak' );
+	if ( @file_put_contents( $self, $code ) ) {
+		@chmod( $self, 0444 );
+		up2s_alert( 'UP2 Shield frissült: ' . UP2_SHIELD_LOADED . ' → ' . $remote,
+			'A biztonsági plugin automatikusan frissült a központi helyről. Ha nem várt, ellenőrizd.' );
+		up2s_log( 'updated', UP2_SHIELD_LOADED . ' -> ' . $remote );
+	} else {
+		@chmod( $self, 0444 );
+		up2s_log( 'update_failed', 'nem írható: ' . $self );
+	}
+}
