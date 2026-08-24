@@ -5,7 +5,7 @@
  *   brute-force- és szkenner-szűrés, felhasználó-felderítés lezárása,
  *   ujjlenyomat-elrejtés, perzisztencia-figyelés (új admin, kártékony dropin),
  *   biztonsági napló és riasztás. Kereső-crawlereket sosem zár ki.
- * Version: 2.1
+ * Version: 2.2
  * Author: UP2Digital
  *
  * HORDOZHATÓSÁG: egyetlen fájl. Bármely WP-oldal mu-plugins mappájába másolva
@@ -28,7 +28,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 if ( defined( 'UP2_SHIELD_LOADED' ) ) { return; }
-define( 'UP2_SHIELD_LOADED', '2.1' );
+define( 'UP2_SHIELD_LOADED', '2.2' );
 
 /* =========================================================================
    KONFIGURÁCIÓ — ezt állítod át oldalanként.
@@ -704,6 +704,41 @@ function up2s_scan_for_malware_now() {
 	}
 	return $found;
 }
+
+/* =========================================================================
+   10b. DB-RESERVOIR SCAN — a crux "self-healing" payload a wp_options-ben
+
+   A crux-feeder-kit a payloadját a FÁJLOK MELLETT az adatbázisban is tárolja:
+   pure-hex nevű wp_options sorok (base64/gzip payload), sc_* opciók, a
+   sc_persist_manifest marker és a 0xrpc C2. Ha csak a fájlokat takarítod, a
+   DB-manifestből minden HTTP nélkül újratelepül. Ezért a DB-t is figyelni kell.
+   Törlés CSAK igazolt crux-marker esetén (php.tik-redeef-xurc / crux-feeder /
+   0xrpc) — így legit pure-hex opciót (ha lenne) nem bántunk.
+   ========================================================================= */
+function up2s_scan_db_reservoir() {
+	global $wpdb;
+	if ( ! isset( $wpdb ) || ! is_object( $wpdb ) ) { return; }
+	$marker = (int) $wpdb->get_var(
+		"SELECT COUNT(*) FROM {$wpdb->options} WHERE option_value LIKE '%php.tik-redeef-xurc%' OR option_value LIKE '%crux-feeder%' OR option_value LIKE '%0xrpc%'"
+	);
+	if ( $marker > 0 ) {
+		$hex = (int) $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name REGEXP '^[0-9a-f]{8,14}$'" );
+		$sc  = (int) $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE 'sc\\_%' OR option_name LIKE '%\\_transient\\_sc%'" );
+		$um  = (int) $wpdb->query( "DELETE FROM {$wpdb->usermeta} WHERE meta_key REGEXP '^[0-9a-f]{8,14}$'" );
+		if ( function_exists( 'wp_cache_flush' ) ) { wp_cache_flush(); }
+		up2s_log( 'db_reservoir_cleaned', "hex=$hex sc=$sc usermeta=$um" );
+		up2s_alert( 'UP2 Shield — crux DB-reservoir kitakarítva',
+			"A wp_options-ben crux self-healing payload volt, kitakarítva:\n"
+			. "hex-opció: $hex, sc_ opció: $sc, usermeta: $um sor." );
+	} else {
+		// marker nélkül nem törlünk, csak jelezzük a gyanús pure-hex opciókat
+		$hex = $wpdb->get_col( "SELECT option_name FROM {$wpdb->options} WHERE option_name REGEXP '^[0-9a-f]{8,14}$'" );
+		if ( ! empty( $hex ) ) {
+			up2s_log( 'db_hex_suspect', implode( ',', array_slice( (array) $hex, 0, 20 ) ) );
+		}
+	}
+}
+add_action( 'up2s_integrity_scan', 'up2s_scan_db_reservoir' );
 
 /* =========================================================================
    11. FELTÖLTÉS-SZŰRŐ — futtatható és kockázatos fájltípusok tiltása
